@@ -6,6 +6,9 @@ import os
 import json
 import time
 from datetime import datetime
+from astrbot.api.event import platform_adapter_type, event_message_type
+from astrbot.api.platform import PlatformAdapterType
+from astrbot.api.event import EventMessageType
 
 @register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
 class MyPlugin(Star):
@@ -99,15 +102,12 @@ class EsChatStorePlugin(Star):
         except Exception as e:
             logger.error(f"创建索引失败: {str(e)}")
 
-    # 注册消息处理器，监听所有消息
-    @filter.message
+    # 使用 platform_adapter_type 装饰器，只监听 Gewechat 平台的消息
+    @platform_adapter_type(PlatformAdapterType.GEWECHAT)
+    @event_message_type(EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """监听并存储所有 gewechat 消息到 Elasticsearch"""
         if not self.enabled or self.es_client is None:
-            return
-        
-        # 检查平台是否为 gewechat
-        if event.get_platform_name() != "gewechat":
             return
         
         try:
