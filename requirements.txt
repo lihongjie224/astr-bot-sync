@@ -1,1 +1,1 @@
-elasticsearch>=8.0.0
+# 没有额外依赖，SQLite 是 Python 内置的

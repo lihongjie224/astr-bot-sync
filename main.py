@@ -1,87 +1,85 @@
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from elasticsearch import Elasticsearch
 import os
 import json
 import time
+import sqlite3
 from datetime import datetime
 
-@register("astrbot_plugin_es_chat_store", "User", "存储 gewechat 聊天记录到 Elasticsearch", "1.0.0")
-class EsChatStorePlugin(Star):
+@register("astrbot_plugin_sqlite_chat_store", "User", "存储 gewechat 聊天记录到 SQLite 数据库", "1.0.0")
+class SqliteChatStorePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.es_client = None
-        self.es_index = "gewechat_chat_records"
-        self.es_host = "http://localhost:9200"  # 默认 ES 地址
-        self.config_file = "es_chat_store_config.json"
+        self.db_conn = None
+        self.db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_records.db")
+        self.config_file = "sqlite_chat_store_config.json"
         self.enabled = False
         
     async def initialize(self):
-        """初始化 Elasticsearch 连接和配置"""
+        """初始化 SQLite 数据库连接和配置"""
         try:
             # 读取配置文件
             config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.config_file)
             if os.path.exists(config_path):
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                    self.es_host = config.get("es_host", self.es_host)
-                    self.es_index = config.get("es_index", self.es_index)
+                    self.db_path = config.get("db_path", self.db_path)
                     self.enabled = config.get("enabled", False)
             else:
                 # 创建默认配置文件
                 default_config = {
-                    "es_host": self.es_host,
-                    "es_index": self.es_index,
+                    "db_path": self.db_path,
                     "enabled": self.enabled
                 }
                 with open(config_path, 'w', encoding='utf-8') as f:
                     json.dump(default_config, f, indent=2, ensure_ascii=False)
                 logger.info(f"已创建默认配置文件: {config_path}")
             
-            # 初始化 ES 客户端 
+            # 初始化 SQLite 数据库
             if self.enabled:
-                self.es_client = Elasticsearch(self.es_host)
-                # 检查连接
-                if self.es_client.ping():
-                    logger.info(f"Elasticsearch 连接成功: {self.es_host}")
-                    # 检查索引是否存在
-                    if not self.es_client.indices.exists(index=self.es_index):
-                        # 创建索引
-                        self.create_index()
-                else:
-                    logger.error(f"Elasticsearch 连接失败: {self.es_host}")
-                    self.enabled = False
+                self.db_conn = sqlite3.connect(self.db_path)
+                # 创建表（如果不存在）
+                self.create_tables()
+                logger.info(f"SQLite 数据库连接成功: {self.db_path}")
         except Exception as e:
-            logger.error(f"初始化 Elasticsearch 连接失败: {str(e)}")
+            logger.error(f"初始化 SQLite 数据库连接失败: {str(e)}")
             self.enabled = False
 
-    def create_index(self):
-        """创建 Elasticsearch 索引和映射"""
+    def create_tables(self):
+        """创建 SQLite 数据表（如果不存在）"""
         try:
-            mappings = {
-                "mappings": {
-                    "properties": {
-                        "group_id": {"type": "keyword"},  # 群聊ID
-                        "sender_id": {"type": "keyword"},  # 发送者ID
-                        "sender_name": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},  # 发送者名称
-                        "message": {"type": "text", "analyzer": "ik_max_word"},  # 消息内容
-                        "timestamp": {"type": "date"},  # 消息时间戳
-                        "message_id": {"type": "keyword"},  # 消息ID
-                        "platform": {"type": "keyword"},  # 平台类型
-                    }
-                }
-            }
-            self.es_client.indices.create(index=self.es_index, body=mappings)
-            logger.info(f"创建索引成功: {self.es_index}")
+            cursor = self.db_conn.cursor()
+            
+            # 创建聊天记录表
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT,
+                sender_id TEXT NOT NULL,
+                sender_name TEXT,
+                message TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                message_id TEXT,
+                platform TEXT NOT NULL
+            )
+            ''')
+            
+            # 创建索引
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_id ON chat_records (group_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sender_id ON chat_records (sender_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON chat_records (timestamp)')
+            
+            self.db_conn.commit()
+            logger.info("创建数据表和索引成功")
         except Exception as e:
-            logger.error(f"创建索引失败: {str(e)}")
+            logger.error(f"创建数据表失败: {str(e)}")
 
     # 使用正确的监听器装饰器监听所有消息
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """监听并存储所有 gewechat 消息到 Elasticsearch"""
-        if not self.enabled or self.es_client is None:
+        """监听并存储所有 gewechat 消息到 SQLite"""
+        if not self.enabled or self.db_conn is None:
             return
         
         # 检查平台是否为 gewechat
@@ -94,53 +92,54 @@ class EsChatStorePlugin(Star):
             sender = message_obj.sender
             
             # 准备存储数据
-            doc = {
-                "group_id": message_obj.group_id,  # 如果是群聊，这里会有值
-                "sender_id": sender.user_id,
-                "sender_name": sender.nickname or sender.user_id,
-                "message": message_obj.message_str,
-                "timestamp": datetime.fromtimestamp(message_obj.timestamp / 1000 if message_obj.timestamp > 1000000000000 else message_obj.timestamp),
-                "message_id": message_obj.message_id,
-                "platform": "gewechat"
-            }
+            timestamp = datetime.fromtimestamp(
+                message_obj.timestamp / 1000 if message_obj.timestamp > 1000000000000 else message_obj.timestamp
+            ).isoformat()
             
-            # 存储到 ES
-            result = self.es_client.index(index=self.es_index, document=doc)
-            logger.debug(f"存储消息到 ES 成功: {result.get('_id')}")
+            # 插入记录到数据库
+            cursor = self.db_conn.cursor()
+            cursor.execute('''
+            INSERT INTO chat_records (group_id, sender_id, sender_name, message, timestamp, message_id, platform)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                message_obj.group_id,
+                sender.user_id,
+                sender.nickname or sender.user_id,
+                message_obj.message_str,
+                timestamp,
+                message_obj.message_id,
+                "gewechat"
+            ))
+            self.db_conn.commit()
+            logger.debug(f"存储消息到 SQLite 成功，消息ID: {message_obj.message_id}")
         except Exception as e:
-            logger.error(f"存储消息到 ES 失败: {str(e)}")
+            logger.error(f"存储消息到 SQLite 失败: {str(e)}")
 
-    @filter.command("eschat_status")
+    @filter.command("sqlchat_status")
     async def status(self, event: AstrMessageEvent):
-        """查看 ES 聊天存储插件状态"""
+        """查看 SQLite 聊天存储插件状态"""
         status_info = []
-        status_info.append(f"ES 存储插件状态: {'启用' if self.enabled else '禁用'}")
+        status_info.append(f"SQLite 存储插件状态: {'启用' if self.enabled else '禁用'}")
         
-        if self.enabled and self.es_client is not None:
+        if self.enabled and self.db_conn is not None:
             try:
-                # 检查 ES 连接
-                if self.es_client.ping():
-                    status_info.append(f"ES 连接: 正常")
-                    # 获取索引状态
-                    if self.es_client.indices.exists(index=self.es_index):
-                        # 获取文档数量
-                        count = self.es_client.count(index=self.es_index)
-                        status_info.append(f"索引 {self.es_index}: 存在")
-                        status_info.append(f"已存储记录数: {count.get('count', 0)}")
-                    else:
-                        status_info.append(f"索引 {self.es_index}: 不存在")
-                else:
-                    status_info.append(f"ES 连接: 失败")
+                # 检查数据库连接
+                cursor = self.db_conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM chat_records")
+                count = cursor.fetchone()[0]
+                status_info.append(f"数据库连接: 正常")
+                status_info.append(f"数据库路径: {self.db_path}")
+                status_info.append(f"已存储记录数: {count}")
             except Exception as e:
-                status_info.append(f"ES 状态检查失败: {str(e)}")
+                status_info.append(f"数据库状态检查失败: {str(e)}")
         else:
-            status_info.append(f"ES 连接: 未初始化")
+            status_info.append(f"数据库连接: 未初始化")
             
         yield event.plain_result("\n".join(status_info))
 
-    @filter.command("eschat_enable")
+    @filter.command("sqlchat_enable")
     async def enable(self, event: AstrMessageEvent):
-        """启用 ES 聊天存储插件"""
+        """启用 SQLite 聊天存储插件"""
         # 检查管理员权限
         if not event.is_admin():
             yield event.plain_result("只有管理员可以执行此操作")
@@ -158,24 +157,19 @@ class EsChatStorePlugin(Star):
                     json.dump(config, f, indent=2, ensure_ascii=False)
                 
                 self.enabled = True
-                # 初始化 ES 客户端
-                self.es_client = Elasticsearch(self.es_host)
-                if self.es_client.ping():
-                    # 检查索引是否存在
-                    if not self.es_client.indices.exists(index=self.es_index):
-                        # 创建索引
-                        self.create_index()
-                    yield event.plain_result("ES 聊天存储插件已启用")
-                else:
-                    yield event.plain_result(f"启用失败: 无法连接到 Elasticsearch ({self.es_host})")
+                # 初始化 SQLite 连接
+                self.db_conn = sqlite3.connect(self.db_path)
+                # 创建表（如果不存在）
+                self.create_tables()
+                yield event.plain_result("SQLite 聊天存储插件已启用")
             else:
                 yield event.plain_result("配置文件不存在，请先重载插件初始化配置")
         except Exception as e:
             yield event.plain_result(f"启用失败: {str(e)}")
 
-    @filter.command("eschat_disable")
+    @filter.command("sqlchat_disable")
     async def disable(self, event: AstrMessageEvent):
-        """禁用 ES 聊天存储插件"""
+        """禁用 SQLite 聊天存储插件"""
         # 检查管理员权限
         if not event.is_admin():
             yield event.plain_result("只有管理员可以执行此操作")
@@ -193,16 +187,19 @@ class EsChatStorePlugin(Star):
                     json.dump(config, f, indent=2, ensure_ascii=False)
                 
                 self.enabled = False
-                self.es_client = None
-                yield event.plain_result("ES 聊天存储插件已禁用")
+                # 关闭数据库连接
+                if self.db_conn is not None:
+                    self.db_conn.close()
+                    self.db_conn = None
+                yield event.plain_result("SQLite 聊天存储插件已禁用")
             else:
                 yield event.plain_result("配置文件不存在，请先重载插件初始化配置")
         except Exception as e:
             yield event.plain_result(f"禁用失败: {str(e)}")
 
-    @filter.command("eschat_config")
+    @filter.command("sqlchat_config")
     async def config(self, event: AstrMessageEvent):
-        """配置 ES 聊天存储插件"""
+        """配置 SQLite 聊天存储插件"""
         # 检查管理员权限
         if not event.is_admin():
             yield event.plain_result("只有管理员可以执行此操作")
@@ -210,7 +207,7 @@ class EsChatStorePlugin(Star):
         
         message_parts = event.message_str.split()
         if len(message_parts) < 3:
-            yield event.plain_result("使用方法: /eschat_config [es_host|es_index] <新值>")
+            yield event.plain_result("使用方法: /sqlchat_config [db_path] <新值>")
             return
             
         param = message_parts[1]
@@ -222,12 +219,9 @@ class EsChatStorePlugin(Star):
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                 
-                if param == "es_host":
-                    config["es_host"] = value
-                    self.es_host = value
-                elif param == "es_index":
-                    config["es_index"] = value
-                    self.es_index = value
+                if param == "db_path":
+                    config["db_path"] = value
+                    self.db_path = value
                 else:
                     yield event.plain_result(f"未知参数: {param}")
                     return
@@ -242,11 +236,75 @@ class EsChatStorePlugin(Star):
         except Exception as e:
             yield event.plain_result(f"配置失败: {str(e)}")
     
+    @filter.command("sqlchat_query")
+    async def query(self, event: AstrMessageEvent):
+        """查询聊天记录"""
+        if not self.enabled or self.db_conn is None:
+            yield event.plain_result("SQLite 聊天存储插件未启用")
+            return
+            
+        message_parts = event.message_str.split()
+        if len(message_parts) < 2:
+            yield event.plain_result("使用方法: /sqlchat_query [sender|group|all] [关键词/ID（可选）] [条数限制（默认10）]")
+            return
+            
+        query_type = message_parts[1]
+        keyword = message_parts[2] if len(message_parts) > 2 else None
+        limit = int(message_parts[3]) if len(message_parts) > 3 and message_parts[3].isdigit() else 10
+        
+        try:
+            cursor = self.db_conn.cursor()
+            results = []
+            
+            if query_type == "sender" and keyword:
+                # 查询特定发送者的消息
+                cursor.execute('''
+                SELECT timestamp, sender_name, message, group_id FROM chat_records 
+                WHERE sender_id = ? OR sender_name LIKE ? 
+                ORDER BY timestamp DESC LIMIT ?
+                ''', (keyword, f"%{keyword}%", limit))
+                results = cursor.fetchall()
+                
+            elif query_type == "group" and keyword:
+                # 查询特定群组的消息
+                cursor.execute('''
+                SELECT timestamp, sender_name, message, group_id FROM chat_records 
+                WHERE group_id = ? 
+                ORDER BY timestamp DESC LIMIT ?
+                ''', (keyword, limit))
+                results = cursor.fetchall()
+                
+            elif query_type == "all":
+                # 查询最新消息
+                cursor.execute('''
+                SELECT timestamp, sender_name, message, group_id FROM chat_records 
+                ORDER BY timestamp DESC LIMIT ?
+                ''', (limit,))
+                results = cursor.fetchall()
+                
+            else:
+                yield event.plain_result("未知查询类型，使用方法: /sqlchat_query [sender|group|all] [关键词/ID（可选）] [条数限制（默认10）]")
+                return
+                
+            if not results:
+                yield event.plain_result("未找到匹配的聊天记录")
+                return
+                
+            formatted_results = []
+            for timestamp, sender_name, message, group_id in results:
+                group_info = f"[群:{group_id}]" if group_id else "[私聊]"
+                formatted_results.append(f"{timestamp} {group_info} {sender_name}: {message}")
+                
+            yield event.plain_result("\n\n".join(formatted_results))
+            
+        except Exception as e:
+            yield event.plain_result(f"查询失败: {str(e)}")
+    
     async def terminate(self):
-        """终止插件时关闭 ES 连接"""
-        if self.es_client is not None:
+        """终止插件时关闭数据库连接"""
+        if self.db_conn is not None:
             try:
-                self.es_client.close()
-                logger.info("ES 客户端已关闭")
+                self.db_conn.close()
+                logger.info("SQLite 数据库连接已关闭")
             except Exception as e:
-                logger.error(f"关闭 ES 客户端失败: {str(e)}")
+                logger.error(f"关闭 SQLite 数据库连接失败: {str(e)}")
